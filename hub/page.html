@@ -1,0 +1,11 @@
+<!doctype html><html><body style="font-family:monospace;background:#111;color:#eee">
+<div id="t"></div><div id="s">connecting…</div>
+<script>
+const cid = location.pathname.split("/")[2];
+const es = new EventSource(`/channel/${cid}/events`);
+es.onmessage = e => { const v = JSON.parse(e.data);
+  if (v.type === "queued") s.textContent = "queued — waiting for GPU…";
+  else if (v.type === "tok") { t.innerHTML += `<span style="background:rgba(255,90,90,${Math.min(v.nll/12,0.8)})">${v.text}</span>`; s.textContent = ""; }
+  else if (v.type === "done") s.textContent = "✓ complete";
+};
+</script></body></html>
