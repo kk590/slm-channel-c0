@@ -36,44 +36,30 @@
     button:hover:not(:disabled) { background: #6c6cff; }
     .meta { margin-top: .9rem; font-size: .78rem; color: #6e6e76; font-family: ui-monospace, monospace; }
     .err { color: #ff6b6b; margin-top: .6rem; font-size: .85rem; }
+    .hint { margin-top: .55rem; font-size: .75rem; color: #5a5a62; }
   </style>
 </head>
 <body>
   <div class="card">
     <h1>slm-channel</h1>
-    <p class="sub">Shard-aware router · posts to the least-loaded (or hashed) hub, then opens the live link.</p>
+    <p class="sub">Link-as-receipt · replay-first · fair quotas · shard-aware.</p>
     <textarea id="prompt" placeholder="explain KV cache in one line" maxlength="2000"></textarea>
     <div class="row">
       <button id="go" type="button">Ask</button>
     </div>
     <div id="err" class="err" hidden></div>
     <div class="meta" id="meta">loading shards…</div>
+    <div class="hint">3 asks / day · 1 in-flight · duplicates replay for free</div>
   </div>
 <script>
-/**
- * Configure shard base URLs here (or leave empty to use the current origin as the only shard).
- * Example multi-shard:
- *   const SHARDS = [
- *     "https://you-slm-hub-0.hf.space",
- *     "https://you-slm-hub-1.hf.space",
- *   ];
- */
-const SHARDS = [];  // empty → single-shard mode (this Space)
+const SHARDS = [];  // e.g. ["https://you-slm-hub-0.hf.space", "https://you-slm-hub-1.hf.space"]
 
 async function discover() {
   if (SHARDS.length) return SHARDS.map(u => u.replace(/\/$/, ""));
-  // single-shard: self
   return [location.origin];
 }
 
-function hashPrompt(s) {
-  let h = 0;
-  for (let i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0;
-  return Math.abs(h);
-}
-
 async function pickShard(bases) {
-  // Prefer least pending; fall back to hash sticky.
   const health = await Promise.all(bases.map(async (base) => {
     try {
       const r = await fetch(base + "/healthz", { signal: AbortSignal.timeout(2500) });
@@ -119,7 +105,12 @@ go.onclick = async () => {
     });
     const j = await r.json();
     if (!r.ok) throw new Error(j.error || r.statusText);
-    // open channel on the same origin the job was accepted on
+    // receipt-style: show queue / replay before redirect
+    if (j.replay) {
+      meta.textContent = `replay · ${j.link}`;
+    } else if (j.position != null) {
+      meta.textContent = `queued #${j.position} · ETA ~${j.eta}s · ${j.asks_left} left today`;
+    }
     location.href = chosen.base + (j.link || ("/c/" + j.channel));
   } catch (e) {
     err.textContent = e.message || String(e);

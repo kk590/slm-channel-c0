@@ -1,75 +1,102 @@
 # slm-channel C0 kit
 
-HF Spaces hub (control plane) + Modal T4 worker (muscle, cold-starts only when work exists) + CPU fallback, all $0.
+HF Spaces hub + Modal T4 worker + CPU / Kaggle fallbacks. **$0**, clone-ready, efficiency levers stacked.
 
-Includes a **sharding layer** from day one: `SHARD_ID`, `/healthz`, token-batch SSE fan-out, and a tiny router page.
+## Efficiency levers (in this repo)
+
+| Lever | Where | Gain |
+|-------|--------|------|
+| **200ms SSE token batching** | `hub.py` `SSE_BATCH_MS=200` | 5–10× viewer capacity per hub |
+| **Prompt dedupe** | `hub.py` `DEDUPE_WINDOW=3600` | 30–50% GPU load deleted (replay) |
+| **INT4 quantization** | `worker_modal.py` bitsandbytes 4-bit | ~2–4× more batch headroom |
+| **Batch-4 + 15s collect** | claim `capacity:4` + `collect_window_ms:15000` | 7 → 20–28 gens/min |
+| **max_new 192** | `MAX_NEW` | ~2× more asks/hour |
+| **Quotas 3/day + 1 in-flight** | `QUOTA_PER_DAY` | fair-share, no GPU hog |
+| **Peak-hour Modal tick** | `PEAK_START`/`PEAK_END` UTC | credits last the month |
+| **Link-as-receipt** | queued `#{pos} · ETA ~{s}s` | delay becomes UX |
+| **Replay-first SSE** | history free, zero GPU | unlimited passive viewers |
+
+Stacked: the difference between ~15k and ~50k+ served generations/day on the same free inventory.
 
 ## File tree
 
 ```
 slm-channel-c0/
-├── hub/                    → upload to an HF Space (Docker SDK)
-│   ├── hub.py              ← control plane: links, queue, SSE, SQLite, sharding
-│   ├── page.html           ← channel viewer (handles batched tokens)
-│   ├── router.html         ← shard-aware landing / ask form
+├── hub/
+│   ├── hub.py           # control plane: dedupe, quotas, batch SSE, sharding, ETA
+│   ├── page.html        # NLL heat-map + receipt status
+│   ├── router.html      # least-loaded multi-shard ask form
 │   └── Dockerfile
 └── worker/
-    ├── agents.py           ← shell agents
-    └── worker_modal.py     ← deploy with `modal deploy`
+    ├── agents.py
+    ├── worker_modal.py  # primary T4, peak-hour, batch-4, INT4
+    ├── fallback_cpu.py  # always-on Qwen-0.5B (Space / free VPS)
+    └── kaggle_worker.py # evening T4×2 burst, 30h/week
 ```
 
-**Worker protocol (HTTP — works through any free host):**  
-`POST /worker/claim` · `POST /worker/event` · `POST /worker/done` · `GET /worker/pending`
+**Worker protocol:** `POST /worker/claim` · `POST /worker/event` · `POST /worker/done` · `GET /worker/pending`  
+**Health:** `GET /healthz`
 
-**Ops / health:** `GET /healthz` → `{ ok, shard_id, num_shards, pending, leased, channels, … }`
+## Env knobs
 
-## Sharding
+| Var | Default | Purpose |
+|-----|---------|--------|
+| `SHARD_ID` / `NUM_SHARDS` | `0` / `1` | horizontal hub scale |
+| `SSE_BATCH_SIZE` / `SSE_BATCH_MS` | `8` / `200` | token coalescing |
+| `DEDUPE_WINDOW` | `3600` | prompt replay window (s) |
+| `MAX_NEW` | `192` | hard token budget |
+| `QUOTA_PER_DAY` | `3` | asks per user per day |
+| `SECS_PER_GEN` | `12` | ETA heuristic |
+| `PEAK_START` / `PEAK_END` | `13` / `23` | Modal GPU wake window (UTC) |
+| `CLAIM_CAPACITY` | `4` | jobs per claim |
+| `COLLECT_WINDOW_MS` | `15000` | wait to fill a batch |
 
-| Env var | Default | Purpose |
-|---------|---------|--------|
-| `SHARD_ID` | `0` | Identity of this hub instance |
-| `NUM_SHARDS` | `1` | Total shards (informational / router) |
-| `SSE_BATCH_SIZE` | `4` | Tokens coalesced per SSE frame |
-| `SSE_BATCH_MS` | `40` | Max wait before flushing a partial batch |
-
-- **Single Space:** leave defaults. Router at `/` posts to itself.
-- **Multi-Space:** deploy N Spaces with `SHARD_ID=0…N-1`. Edit `SHARDS = […]` in `router.html` (or host the router on one of them / a static page). The router probes `/healthz` and sends the job to the least-loaded healthy shard, then redirects to that shard’s `/c/{cid}`.
-
-Token batching reduces SSE message rate under load; `page.html` accepts both single events and `{ "type": "batch", "events": […] }`.
-
-## Deploy — 4 commands
+## Deploy order (ROI)
 
 ```bash
-# 1. Hub: create HF Space (Docker SDK), upload hub/ files →
-#      https://YOURNAME-slm-hub.hf.space
-#    Optional Space secrets / variables:
-#      SHARD_ID=0  NUM_SHARDS=1
-# 2. Worker: pip install modal && modal setup
+# 1) Hub (HF Space, Docker SDK) — upload hub/
+#    https://YOURNAME-slm-hub.hf.space
+
+# 2) Modal primary worker (peak hours only by default)
+pip install modal && modal setup
 modal secret create hub-url HUB_URL=https://YOURNAME-slm-hub.hf.space
 modal deploy worker/worker_modal.py
-# 3. Test:
+
+# 3) Optional: CPU fallback on the Space or a free always-on host
+HUB_URL=https://YOURNAME-slm-hub.hf.space python worker/fallback_cpu.py
+
+# 4) Optional: Kaggle evening burst — paste kaggle_worker.py, set HUB_URL, run
+
+# 5) Test
 curl -s https://YOURNAME-slm-hub.hf.space/healthz
 curl -X POST https://YOURNAME-slm-hub.hf.space/api/ask \
-  -H "content-type: application/json" \
+  -H 'content-type: application/json' \
   -d '{"prompt":"explain KV cache in one line"}'
-#    → open the /c/{cid} link (or use the router at /)
-# 4. Optional Kaggle burst: same claim/report loop over HTTPS for 30h/week extra.
+# → open /c/{cid}  (or use router at /)
 ```
 
-## Persistence trick ($0, HF-native)
+**Shard #2 only when hub-1 actually hits ~1k concurrent viewers.** 3–4 free Spaces + least-loaded router → ~3–8k concurrent viewers; replay is free forever.
 
-Free Spaces wipe on rebuild → add a short hourly snapshot in `hub.py`: `huggingface_hub.HfApi().upload_file(...)` of `channels.db` to a **private dataset repo**, and pull it on boot. Links survive rebuilds — still $0.
+## Free GPU inventory
 
-## What you get
+| Source | Free tier | Role |
+|--------|-----------|------|
+| Modal | ~$30/mo ≈ 45–60 GPU-hrs | primary — peak hours so credits last |
+| Kaggle | T4×2, 30h/week | evening burst |
+| HF Spaces CPU | always-on 2 vCPU | Qwen-0.5B fallback |
+| Lightning / Saturn | ~10–15 hrs/mo | extra burst |
 
-| | |
-|---|---|
-| Live shareable `/c/{cid}` links with NLL heat-map | ✅ |
-| GPU bills **only while generating** (tick → wake → drain → idle-out) | ✅ |
-| `/healthz` + `SHARD_ID` for horizontal scale | ✅ |
-| Token-batch SSE fan-out | ✅ |
-| Router page (least-loaded / multi-Space ready) | ✅ |
-| Capacity v1 (sequential) | ~350–600 DAU |
-| Batch-4 claim upgrade | → ~600–1,200 DAU |
+## $0 ceiling (honest)
 
-Next upgrades in order: **batch-4 claim** → **CPU fallback worker** → **per-user fair queue + quotas**.
+```
+Viewers:  3–4 shards × 1–2k     →  ~3–8k concurrent
+Asks:     Modal + Kaggle + CPU  →  ~3–6k gens/day base
+          + dedupe + INT4 + quotas → up to ~8–10k/day
+Result:   ~1,500–2,500 DAU / ~8–12k registered   ← hard $0 asymptote
+```
+
+Beyond that: asks need real GPU-hours. Ladder is **$0 → ~2k DAU → C1 at $25–30/mo → ~2k more**.
+
+## Persistence ($0, HF-native)
+
+Spaces wipe on rebuild → snapshot `channels.db` hourly to a private dataset via `huggingface_hub`, restore on boot. Links survive — still free.

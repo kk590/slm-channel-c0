@@ -6,22 +6,31 @@
   <title>channel</title>
   <style>
     body{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#111;color:#eee;margin:0;padding:1.25rem;line-height:1.55}
+    #meta{color:#6e6e76;font-size:.8rem;margin-bottom:.75rem}
     #t{white-space:pre-wrap;word-break:break-word}
     #s{color:#888;margin-top:1rem;font-size:.9rem}
     .tok{transition:background .15s}
+    .receipt{display:inline-block;background:#1c1c20;border:1px solid #2a2a2e;border-radius:8px;padding:.35rem .65rem;color:#b0b0b8}
   </style>
 </head>
 <body>
+  <div id="meta"></div>
   <div id="t"></div>
   <div id="s">connecting…</div>
 <script>
 const cid = location.pathname.split("/").filter(Boolean).pop();
 const t = document.getElementById("t");
 const s = document.getElementById("s");
+const metaEl = document.getElementById("meta");
 
 function paint(v) {
+  if (v.type === "meta") {
+    metaEl.textContent = (v.prompt ? v.prompt.slice(0, 120) : "") + (v.shard != null ? `  ·  shard ${v.shard}` : "");
+    return;
+  }
   if (v.type === "queued") {
-    s.textContent = "queued — waiting for GPU…";
+    const label = v.text || "queued — waiting for GPU…";
+    s.innerHTML = `<span class="receipt">${label}</span>`;
   } else if (v.type === "tok") {
     const span = document.createElement("span");
     span.className = "tok";
@@ -47,7 +56,7 @@ es.onmessage = e => {
   try { handle(JSON.parse(e.data)); }
   catch (_) {}
 };
-es.onerror = () => { s.textContent = "reconnecting…"; };
+es.onerror = () => { if (!s.textContent.includes("complete") && !s.textContent.includes("error")) s.textContent = "reconnecting…"; };
 </script>
 </body>
 </html>
