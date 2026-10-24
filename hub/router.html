@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>slm-channel router</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+      background: #0b0b0c; color: #e8e8ea;
+      margin: 0; min-height: 100vh;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .card {
+      width: min(440px, 92vw);
+      background: #161618; border: 1px solid #2a2a2e;
+      border-radius: 14px; padding: 1.5rem 1.6rem 1.35rem;
+      box-shadow: 0 12px 40px rgba(0,0,0,.45);
+    }
+    h1 { font-size: 1.05rem; font-weight: 600; margin: 0 0 .35rem; letter-spacing: -.01em; }
+    p.sub { margin: 0 0 1.1rem; color: #8b8b93; font-size: .85rem; }
+    textarea {
+      width: 100%; box-sizing: border-box; resize: vertical; min-height: 88px;
+      background: #0e0e10; border: 1px solid #2f2f34; border-radius: 10px;
+      color: #eee; padding: .75rem .85rem; font: inherit; line-height: 1.45;
+    }
+    textarea:focus { outline: none; border-color: #5b5bff; }
+    .row { display: flex; gap: .6rem; margin-top: .85rem; align-items: center; }
+    button {
+      flex: 1; border: 0; border-radius: 10px; padding: .7rem 1rem;
+      background: #5b5bff; color: #fff; font-weight: 600; font-size: .95rem;
+      cursor: pointer;
+    }
+    button:disabled { opacity: .55; cursor: default; }
+    button:hover:not(:disabled) { background: #6c6cff; }
+    .meta { margin-top: .9rem; font-size: .78rem; color: #6e6e76; font-family: ui-monospace, monospace; }
+    .err { color: #ff6b6b; margin-top: .6rem; font-size: .85rem; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>slm-channel</h1>
+    <p class="sub">Shard-aware router · posts to the least-loaded (or hashed) hub, then opens the live link.</p>
+    <textarea id="prompt" placeholder="explain KV cache in one line" maxlength="2000"></textarea>
+    <div class="row">
+      <button id="go" type="button">Ask</button>
+    </div>
+    <div id="err" class="err" hidden></div>
+    <div class="meta" id="meta">loading shards…</div>
+  </div>
+<script>
+/**
+ * Configure shard base URLs here (or leave empty to use the current origin as the only shard).
+ * Example multi-shard:
+ *   const SHARDS = [
+ *     "https://you-slm-hub-0.hf.space",
+ *     "https://you-slm-hub-1.hf.space",
+ *   ];
+ */
+const SHARDS = [];  // empty → single-shard mode (this Space)
+
+async function discover() {
+  if (SHARDS.length) return SHARDS.map(u => u.replace(/\/$/, ""));
+  // single-shard: self
+  return [location.origin];
+}
+
+function hashPrompt(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0;
+  return Math.abs(h);
+}
+
+async function pickShard(bases) {
+  // Prefer least pending; fall back to hash sticky.
+  const health = await Promise.all(bases.map(async (base) => {
+    try {
+      const r = await fetch(base + "/healthz", { signal: AbortSignal.timeout(2500) });
+      const j = await r.json();
+      return { base, pending: j.pending ?? 99, ok: !!j.ok, shard: j.shard_id };
+    } catch {
+      return { base, pending: 999, ok: false, shard: "?" };
+    }
+  }));
+  const live = health.filter(h => h.ok);
+  if (!live.length) throw new Error("no healthy shards");
+  live.sort((a, b) => a.pending - b.pending);
+  return live[0];
+}
+
+const meta = document.getElementById("meta");
+const err  = document.getElementById("err");
+const go   = document.getElementById("go");
+const promptEl = document.getElementById("prompt");
+
+let bases = [];
+discover().then(b => {
+  bases = b;
+  meta.textContent = bases.length === 1
+    ? `shard: ${bases[0]}`
+    : `${bases.length} shards configured`;
+}).catch(e => { meta.textContent = "discover failed: " + e.message; });
+
+go.onclick = async () => {
+  err.hidden = true;
+  const prompt = promptEl.value.trim();
+  if (!prompt) { err.textContent = "empty prompt"; err.hidden = false; return; }
+  go.disabled = true;
+  go.textContent = "routing…";
+  try {
+    if (!bases.length) bases = await discover();
+    const chosen = await pickShard(bases);
+    meta.textContent = `→ shard ${chosen.shard} (pending ${chosen.pending})`;
+    const r = await fetch(chosen.base + "/api/ask", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt }),
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || r.statusText);
+    // open channel on the same origin the job was accepted on
+    location.href = chosen.base + (j.link || ("/c/" + j.channel));
+  } catch (e) {
+    err.textContent = e.message || String(e);
+    err.hidden = false;
+    go.disabled = false;
+    go.textContent = "Ask";
+  }
+};
+
+promptEl.addEventListener("keydown", e => {
+  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) go.click();
+});
+</script>
+</body>
+</html>

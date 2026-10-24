@@ -1,11 +1,53 @@
-<!doctype html><html><body style="font-family:monospace;background:#111;color:#eee">
-<div id="t"></div><div id="s">connecting…</div>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>channel</title>
+  <style>
+    body{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#111;color:#eee;margin:0;padding:1.25rem;line-height:1.55}
+    #t{white-space:pre-wrap;word-break:break-word}
+    #s{color:#888;margin-top:1rem;font-size:.9rem}
+    .tok{transition:background .15s}
+  </style>
+</head>
+<body>
+  <div id="t"></div>
+  <div id="s">connecting…</div>
 <script>
-const cid = location.pathname.split("/")[2];
+const cid = location.pathname.split("/").filter(Boolean).pop();
+const t = document.getElementById("t");
+const s = document.getElementById("s");
+
+function paint(v) {
+  if (v.type === "queued") {
+    s.textContent = "queued — waiting for GPU…";
+  } else if (v.type === "tok") {
+    const span = document.createElement("span");
+    span.className = "tok";
+    span.style.background = `rgba(255,90,90,${Math.min((v.nll || 0) / 12, 0.8)})`;
+    span.textContent = v.text;
+    t.appendChild(span);
+    s.textContent = "";
+  } else if (v.type === "done" || v.type === "error") {
+    s.textContent = v.type === "done" ? "✓ complete" : "✗ error";
+  }
+}
+
+function handle(msg) {
+  if (msg.type === "batch" && Array.isArray(msg.events)) {
+    msg.events.forEach(paint);
+  } else {
+    paint(msg);
+  }
+}
+
 const es = new EventSource(`/channel/${cid}/events`);
-es.onmessage = e => { const v = JSON.parse(e.data);
-  if (v.type === "queued") s.textContent = "queued — waiting for GPU…";
-  else if (v.type === "tok") { t.innerHTML += `<span style="background:rgba(255,90,90,${Math.min(v.nll/12,0.8)})">${v.text}</span>`; s.textContent = ""; }
-  else if (v.type === "done") s.textContent = "✓ complete";
+es.onmessage = e => {
+  try { handle(JSON.parse(e.data)); }
+  catch (_) {}
 };
-</script></body></html>
+es.onerror = () => { s.textContent = "reconnecting…"; };
+</script>
+</body>
+</html>
