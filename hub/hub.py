@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS users(
     user_key TEXT PRIMARY KEY, asks_day INT, day_epoch INT, in_flight INT
 );
 CREATE INDEX IF NOT EXISTS idx_channels_phash ON channels(prompt_hash, status, created);
-CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, rowid);
+CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+CREATE INDEX IF NOT EXISTS idx_events_cid ON events(cid);
 """)
 for col, typ in [("shard", "TEXT"), ("prompt_hash", "TEXT"), ("user_key", "TEXT")]:
     try:
