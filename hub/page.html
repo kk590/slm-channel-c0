@@ -26,6 +26,16 @@ const metaEl = document.getElementById("meta");
 function paint(v) {
   if (v.type === "meta") {
     metaEl.textContent = (v.prompt ? v.prompt.slice(0, 120) : "") + (v.shard != null ? `  ·  shard ${v.shard}` : "");
+    // leave "connecting…" using channel status from server
+    if (v.status === "queued" || v.status === "pending") {
+      s.innerHTML = '<span class="receipt">queued — waiting for GPU…</span>';
+    } else if (v.status === "leased" || v.status === "running") {
+      s.innerHTML = '<span class="receipt">generating…</span>';
+    } else if (v.status === "done") {
+      s.textContent = "✓ complete";
+    } else if (v.status === "error") {
+      s.textContent = "✗ error";
+    }
     return;
   }
   if (v.type === "queued") {
@@ -56,7 +66,10 @@ es.onmessage = e => {
   try { handle(JSON.parse(e.data)); }
   catch (_) {}
 };
-es.onerror = () => { if (!s.textContent.includes("complete") && !s.textContent.includes("error")) s.textContent = "reconnecting…"; };
+es.onerror = () => {
+  if (!s.textContent.includes("complete") && !s.textContent.includes("error"))
+    s.textContent = "reconnecting…";
+};
 </script>
 </body>
 </html>
