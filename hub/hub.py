@@ -1,23 +1,47 @@
-import os, sqlite3, time, uuid, json, asyncio, hashlib
+import os, sqlite3, time, uuid, json, asyncio, hashlib, threading
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 
-# ── sharding + efficiency knobs ───────────────────────────────────────────
 SHARD_ID   = os.environ.get("SHARD_ID", "0")
 NUM_SHARDS = int(os.environ.get("NUM_SHARDS", "1"))
-
 BATCH_SIZE = int(os.environ.get("SSE_BATCH_SIZE", "8"))
 BATCH_MS   = float(os.environ.get("SSE_BATCH_MS", "200"))
-
 DEDUPE_WINDOW = int(os.environ.get("DEDUPE_WINDOW", "3600"))
 MAX_NEW = int(os.environ.get("MAX_NEW", "192"))
-QUOTA_PER_DAY = int(os.environ.get("QUOTA_PER_DAY", "3"))
+QUOTA_PER_DAY = int(os.environ.get("QUOTA_PER_DAY", "20"))
 SECS_PER_GEN  = float(os.environ.get("SECS_PER_GEN", "12"))
+SSE_HEARTBEAT = float(os.environ.get("SSE_HEARTBEAT", "15"))  # keep proxies from idle-closing
 
-DB = "channels.db"
-db = sqlite3.connect(DB, check_same_thread=False)
+DB = os.environ.get("DB_PATH", "channels.db")
+_db_lock = threading.RLock()
+db = sqlite3.connect(DB, check_same_thread=False, timeout=30)
 db.execute("PRAGMA journal_mode=WAL")
-db.executescript("""
+db.execute("PRAGMA busy_timeout=5000")
+
+def _exec(sql, args=()):
+    with _db_lock:
+        cur = db.execute(sql, args)
+        return cur
+
+def _execmany_script(script):
+    with _db_lock:
+        db.executescript(script)
+        db.commit()
+
+def _commit():
+    with _db_lock:
+        db.commit()
+
+def _fetchone(sql, args=()):
+    with _db_lock:
+        return db.execute(sql, args).fetchone()
+
+def _fetchall(sql, args=()):
+    with _db_lock:
+        return db.execute(sql, args).fetchall()
+
+_execmany_script("""
 CREATE TABLE IF NOT EXISTS channels(
     cid TEXT PRIMARY KEY, prompt TEXT, status TEXT, created REAL, shard TEXT,
     prompt_hash TEXT, user_key TEXT
@@ -37,13 +61,18 @@ CREATE INDEX IF NOT EXISTS idx_events_cid ON events(cid);
 """)
 for col, typ in [("shard", "TEXT"), ("prompt_hash", "TEXT"), ("user_key", "TEXT")]:
     try:
-        db.execute(f"ALTER TABLE channels ADD COLUMN {col} {typ}")
-        db.commit()
+        _exec(f"ALTER TABLE channels ADD COLUMN {col} {typ}")
+        _commit()
     except Exception:
         pass
-db.commit()
 
 app = FastAPI(title=f"slm-hub shard={SHARD_ID}")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 SUBS: dict[str, list[asyncio.Queue]] = {}
 
 
@@ -64,16 +93,16 @@ def _user_key(r: Request, body: dict) -> str:
 
 def _quota_check(user_key: str) -> tuple[bool, str, dict]:
     day = _day_epoch()
-    row = db.execute("SELECT asks_day, day_epoch, in_flight FROM users WHERE user_key=?", (user_key,)).fetchone()
+    row = _fetchone("SELECT asks_day, day_epoch, in_flight FROM users WHERE user_key=?", (user_key,))
     if not row:
-        db.execute("INSERT INTO users VALUES (?,?,?,?)", (user_key, 0, day, 0))
-        db.commit()
+        _exec("INSERT INTO users VALUES (?,?,?,?)", (user_key, 0, day, 0))
+        _commit()
         return True, "", {"asks_left": QUOTA_PER_DAY, "in_flight": 0}
     asks, d, inflight = row
     if d != day:
         asks, inflight = 0, 0
-        db.execute("UPDATE users SET asks_day=0, day_epoch=?, in_flight=0 WHERE user_key=?", (day, user_key))
-        db.commit()
+        _exec("UPDATE users SET asks_day=0, day_epoch=?, in_flight=0 WHERE user_key=?", (day, user_key))
+        _commit()
     if inflight >= 1:
         return False, "1-in-flight limit: wait for your current ask to finish", {"asks_left": max(0, QUOTA_PER_DAY - asks), "in_flight": inflight}
     if asks >= QUOTA_PER_DAY:
@@ -82,33 +111,33 @@ def _quota_check(user_key: str) -> tuple[bool, str, dict]:
 
 def _quota_consume(user_key: str):
     day = _day_epoch()
-    db.execute(
+    _exec(
         "UPDATE users SET asks_day = asks_day + 1, day_epoch=?, in_flight = in_flight + 1 WHERE user_key=?",
         (day, user_key),
     )
-    db.commit()
+    _commit()
 
 def _quota_release(user_key: str):
     if not user_key:
         return
-    db.execute("UPDATE users SET in_flight = MAX(0, in_flight - 1) WHERE user_key=?", (user_key,))
-    db.commit()
+    _exec("UPDATE users SET in_flight = MAX(0, in_flight - 1) WHERE user_key=?", (user_key,))
+    _commit()
 
 def _queue_position(cid: str) -> int:
-    row = db.execute(
+    row = _fetchone(
         """SELECT 1 + COUNT(*) FROM jobs j
            WHERE j.status='pending'
              AND j.rowid < (SELECT rowid FROM jobs WHERE cid=? AND status='pending' LIMIT 1)""",
         (cid,),
-    ).fetchone()
+    )
     return int(row[0]) if row else 0
 
 def _eta_seconds(position: int) -> int:
-    leased = db.execute("SELECT COUNT(*) FROM jobs WHERE status='leased'").fetchone()[0]
+    leased = _fetchone("SELECT COUNT(*) FROM jobs WHERE status='leased'")[0]
     return max(8, int((max(position, 1) + leased) * SECS_PER_GEN))
 
 def _store_event(cid: str, ev: dict):
-    db.execute(
+    _exec(
         "INSERT INTO events VALUES (?,?,?,?,?,?)",
         (cid, ev.get("i", 0), ev.get("type", ""), ev.get("text", ""), ev.get("nll", 0), time.time()),
     )
@@ -118,7 +147,7 @@ _buffers: dict[str, list] = {}
 _flush_tasks: dict[str, asyncio.Task] = {}
 
 def _raw_push(cid: str, ev: dict):
-    for q in SUBS.get(cid, []):
+    for q in list(SUBS.get(cid, [])):
         try:
             q.put_nowait(ev)
         except asyncio.QueueFull:
@@ -165,9 +194,9 @@ def push(cid: str, ev: dict):
 
 @app.get("/healthz")
 def healthz():
-    pending = db.execute("SELECT COUNT(*) FROM jobs WHERE status='pending'").fetchone()[0]
-    leased  = db.execute("SELECT COUNT(*) FROM jobs WHERE status='leased'").fetchone()[0]
-    channels = db.execute("SELECT COUNT(*) FROM channels").fetchone()[0]
+    pending = _fetchone("SELECT COUNT(*) FROM jobs WHERE status='pending'")[0]
+    leased  = _fetchone("SELECT COUNT(*) FROM jobs WHERE status='leased'")[0]
+    channels = _fetchone("SELECT COUNT(*) FROM channels")[0]
     return {
         "ok": True,
         "shard_id": SHARD_ID,
@@ -186,7 +215,10 @@ def healthz():
 
 @app.post("/api/ask")
 async def ask(r: Request):
-    body = await r.json()
+    try:
+        body = await r.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
     p = (body.get("prompt") or "").strip()[:2000]
     if not p:
         return JSONResponse({"error": "empty prompt"}, status_code=400)
@@ -199,12 +231,12 @@ async def ask(r: Request):
     ph = _phash(p)
     now = time.time()
 
-    hit = db.execute(
+    hit = _fetchone(
         """SELECT cid, status FROM channels
            WHERE prompt_hash=? AND created > ? AND status IN ('done','queued','leased','running')
            ORDER BY CASE status WHEN 'done' THEN 0 ELSE 1 END, created DESC LIMIT 1""",
         (ph, now - DEDUPE_WINDOW),
-    ).fetchone()
+    )
     if hit:
         cid_hit, st = hit
         return {
@@ -219,11 +251,11 @@ async def ask(r: Request):
     cid = body.get("cid") or uuid.uuid4().hex[:10]
     jid = uuid.uuid4().hex[:10]
 
-    db.execute(
+    _exec(
         "INSERT OR REPLACE INTO channels VALUES (?,?,?,?,?,?,?)",
         (cid, p, "queued", now, SHARD_ID, ph, user_key),
     )
-    db.execute("INSERT INTO jobs VALUES (?,?,?,?,?)", (jid, cid, p, "pending", 0))
+    _exec("INSERT INTO jobs VALUES (?,?,?,?,?)", (jid, cid, p, "pending", 0))
 
     pos = _queue_position(cid)
     eta = _eta_seconds(pos)
@@ -235,9 +267,8 @@ async def ask(r: Request):
         "position": pos,
         "eta": eta,
     }
-    # persist so late-opening viewers still leave "connecting…"
     _store_event(cid, queued_ev)
-    db.commit()
+    _commit()
     _quota_consume(user_key)
     push(cid, queued_ev)
 
@@ -256,27 +287,30 @@ async def ask(r: Request):
 @app.get("/worker/pending")
 def pending():
     return {
-        "pending": db.execute("SELECT COUNT(*) FROM jobs WHERE status='pending'").fetchone()[0],
+        "pending": _fetchone("SELECT COUNT(*) FROM jobs WHERE status='pending'")[0],
         "shard": SHARD_ID,
         "max_new": MAX_NEW,
     }
 
 @app.post("/worker/claim")
 async def claim(r: Request):
-    body = await r.json()
+    try:
+        body = await r.json()
+    except Exception:
+        body = {}
     cap = min(int(body.get("capacity", 1)), 4)
     collect_ms = int(body.get("collect_window_ms", 0))
 
     def _take(n):
-        rows = db.execute(
+        rows = _fetchall(
             "SELECT job_id,cid,prompt FROM jobs WHERE status='pending' ORDER BY rowid LIMIT ?",
             (n,),
-        ).fetchall()
+        )
         now = time.time()
-        for j, _, _ in rows:
-            db.execute("UPDATE jobs SET status='leased', leased=? WHERE job_id=?", (now, j))
-            db.execute("UPDATE channels SET status='leased' WHERE cid=(SELECT cid FROM jobs WHERE job_id=?)", (j,))
-        db.commit()
+        for j, c, _ in rows:
+            _exec("UPDATE jobs SET status='leased', leased=? WHERE job_id=?", (now, j))
+            _exec("UPDATE channels SET status='leased' WHERE cid=?", (c,))
+        _commit()
         return rows
 
     rows = _take(cap)
@@ -299,25 +333,34 @@ async def claim(r: Request):
 async def event(r: Request):
     b = await r.json()
     cid = b["cid"]
-    for ev in b["events"]:
+    for ev in b.get("events") or []:
         _store_event(cid, ev)
         push(cid, ev)
-    db.commit()
+    _commit()
     return {"ok": True, "shard": SHARD_ID}
 
 @app.post("/worker/done")
 async def done(r: Request):
     b = await r.json()
     status = b.get("status", "done")
-    db.execute("UPDATE jobs SET status=? WHERE job_id=?", (status, b["job_id"]))
-    db.execute("UPDATE channels SET status=? WHERE cid=?", (status, b["cid"]))
-    row = db.execute("SELECT user_key FROM channels WHERE cid=?", (b["cid"],)).fetchone()
-    if row and row[0]:
-        _quota_release(row[0])
-    term = {"i": -1, "type": status, "text": "", "nll": 0}
-    _store_event(b["cid"], term)
-    db.commit()
-    push(b["cid"], term)
+    job_id = b.get("job_id")
+    cid = b.get("cid")
+    if job_id:
+        _exec("UPDATE jobs SET status=? WHERE job_id=?", (status, job_id))
+        if not cid:
+            row = _fetchone("SELECT cid FROM jobs WHERE job_id=?", (job_id,))
+            cid = row[0] if row else None
+    if cid:
+        _exec("UPDATE channels SET status=? WHERE cid=?", (status, cid))
+        row = _fetchone("SELECT user_key FROM channels WHERE cid=?", (cid,))
+        if row and row[0]:
+            _quota_release(row[0])
+        term = {"i": -1, "type": status, "text": "", "nll": 0}
+        _store_event(cid, term)
+        _commit()
+        push(cid, term)
+    else:
+        _commit()
     return {"ok": True, "shard": SHARD_ID}
 
 
@@ -326,34 +369,41 @@ async def sse(cid: str):
     q: asyncio.Queue = asyncio.Queue(maxsize=512)
     SUBS.setdefault(cid, []).append(q)
 
-    rows = db.execute(
+    rows = _fetchall(
         "SELECT i,type,text,nll FROM events WHERE cid=? ORDER BY rowid", (cid,)
-    ).fetchall()
-    meta = db.execute("SELECT status, prompt FROM channels WHERE cid=?", (cid,)).fetchone()
+    )
+    meta = _fetchone("SELECT status, prompt FROM channels WHERE cid=?", (cid,))
 
     async def gen():
         try:
             if meta:
                 st, prompt = meta
                 yield f"data: {json.dumps({'type': 'meta', 'status': st, 'prompt': prompt, 'shard': SHARD_ID})}\n\n"
+            else:
+                yield f"data: {json.dumps({'type': 'error', 'text': 'unknown channel', 'nll': 0})}\n\n"
+                return
 
             for i, t, x, n in rows:
                 yield f"data: {json.dumps({'i': i, 'type': t, 'text': x, 'nll': n})}\n\n"
 
-            # Late openers: if channel is waiting and history has no status event, synthesize one
             types = {t for _, t, _, _ in rows}
-            if meta and meta[0] in ("queued", "leased", "pending") and "queued" not in types and "tok" not in types:
+            if meta[0] in ("queued", "leased", "pending") and "queued" not in types and "tok" not in types:
                 pos = _queue_position(cid)
                 eta = _eta_seconds(pos or 1)
                 yield f"data: {json.dumps({'i': 0, 'type': 'queued', 'text': f'queued #{pos or 1} · ETA ~{eta}s', 'nll': 0})}\n\n"
 
-            if meta and meta[0] in ("done", "error"):
+            if meta[0] in ("done", "error"):
                 if meta[0] not in types:
                     yield f"data: {json.dumps({'i': -1, 'type': meta[0], 'text': '', 'nll': 0})}\n\n"
                 return
 
             while True:
-                ev = await q.get()
+                try:
+                    ev = await asyncio.wait_for(q.get(), timeout=SSE_HEARTBEAT)
+                except asyncio.TimeoutError:
+                    # SSE comment keeps Render/nginx from closing idle streams
+                    yield ": ping\n\n"
+                    continue
                 yield f"data: {json.dumps(ev)}\n\n"
                 if ev.get("type") in ("done", "error"):
                     break
@@ -369,6 +419,7 @@ async def sse(cid: str):
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
             "X-Shard-Id": SHARD_ID,
         },
@@ -377,7 +428,10 @@ async def sse(cid: str):
 
 @app.get("/c/{cid}", response_class=HTMLResponse)
 def page(cid: str):
-    return open("page.html").read()
+    try:
+        return open("page.html").read()
+    except FileNotFoundError:
+        return HTMLResponse("<pre>page.html missing</pre>", status_code=500)
 
 @app.get("/", response_class=HTMLResponse)
 def root():
